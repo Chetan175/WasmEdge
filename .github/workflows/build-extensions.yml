@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - master
+      - test-mlx-ci
     paths:
       - ".github/extensions.paths-filter.yml"
       - ".github/workflows/build-extensions.yml"
