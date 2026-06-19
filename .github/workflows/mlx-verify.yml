@@ -1,0 +1,62 @@
+name: MLX Backend Verification
+
+on:
+  push:
+    branches:
+      - test-mlx-ci
+  workflow_dispatch:
+
+jobs:
+  verify-mlx:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: brew install cmake ninja wget
+
+      - name: Build WasmEdge with MLX Backend
+        run: |
+          mkdir build && cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DWASMEDGE_USE_LLVM=OFF -DWASMEDGE_BUILD_TESTS=OFF -DWASMEDGE_PLUGIN_WASI_NN_BACKEND=MLX -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+          ninja
+          echo "$PWD/tools/wasmedge" >> $GITHUB_PATH
+          echo "WASMEDGE_PLUGIN_PATH=$PWD/plugins" >> $GITHUB_ENV
+      - name: Install Rust and WASI target
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-wasip1
+      - name: Create Custom Wasm Test App
+        run: |
+          source "$HOME/.cargo/env"
+          cargo new mlx_app
+          cd mlx_app
+          cargo add wasmedge-wasi-nn@0.8.0
+          cat << 'EOF' > src/main.rs
+          use wasmedge_wasi_nn::*;
+          fn main() {
+              println!("Loading MLX model via WASI-NN...");
+              let graph = GraphBuilder::new(GraphEncoding::Ggml, ExecutionTarget::AUTO).build_from_cache("default").unwrap();
+              let mut ctx = graph.init_execution_context().unwrap();
+              ctx.set_input(0, TensorType::U8, &[1], "Hello".as_bytes()).unwrap();
+              println!("Computing...");
+              ctx.compute().unwrap();
+              let mut out = vec![0u8; 1024];
+              let len = ctx.get_output(0, &mut out).unwrap();
+              println!("MLX Output: {}", String::from_utf8_lossy(&out[..len]));
+          }
+          EOF
+          cargo build --target wasm32-wasip1 --release
+      - name: Download Model and Run Verification
+        run: |
+          mkdir mlx_test && cd mlx_test
+          cp ../mlx_app/target/wasm32-wasip1/release/mlx_app.wasm .
+          # Download TinyLlama model and tokenizer
+          wget https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors
+          wget https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json
+          # Create MLX WASI-NN metadata
+          echo '{"model_type": "tiny_llama_1.1B_chat_v1.0", "enable_debug_log": true, "max_token": 10, "tokenizer": "tokenizer.json"}' > metadata.json
+          # Run the custom Wasm app
+          wasmedge --dir .:. --nn-preload default:MLX:AUTO:model.safetensors:metadata.json mlx_app.wasm
